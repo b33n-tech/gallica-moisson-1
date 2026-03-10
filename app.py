@@ -13,6 +13,13 @@ GALLICA_BASE   = "https://gallica.bnf.fr"
 TIMEOUT        = 15   # secondes par requête
 MAX_ISSUES     = 500  # garde-fou pour éviter les boucles infinies
 
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (compatible; GallicaHarvester/1.0; "
+        "+https://github.com/user/gallica-harvester)"
+    )
+}
+
 # ─── Utilitaires ──────────────────────────────────────────────────────────────
 
 def extract_ark(url: str) -> str | None:
@@ -53,7 +60,7 @@ def get_issues(ark: str, max_records: int = MAX_ISSUES) -> list[dict]:
         }
 
         try:
-            resp = requests.get(GALLICA_SRU, params=params, timeout=TIMEOUT)
+            resp = requests.get(GALLICA_SRU, params=params, headers=HEADERS, timeout=TIMEOUT)
             resp.raise_for_status()
         except requests.exceptions.Timeout:
             raise TimeoutError(
