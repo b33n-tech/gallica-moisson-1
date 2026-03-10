@@ -27,10 +27,37 @@ def extract_ark(url: str) -> str | None:
     return None
 
 
+def build_gallica_url(ark_value: str) -> str:
+    """
+    Construit une URL Gallica valide depuis n'importe quelle forme d'ARK.
+    Formes acceptées :
+      - "bpt6k310197"              → https://gallica.bnf.fr/ark:/12148/bpt6k310197
+      - "ark:/12148/bpt6k310197"   → https://gallica.bnf.fr/ark:/12148/bpt6k310197
+      - "https://gallica.bnf.fr/…" → inchangé (déjà une URL complète valide)
+    """
+    ark_value = ark_value.strip()
+
+    # Déjà une URL complète avec ark:/12148/ → OK
+    if ark_value.startswith("http") and "ark:/12148/" in ark_value:
+        # On nettoie les qualifiers parasites (.r=...) éventuels
+        return re.sub(r"\.r=[^\s/]*", "", ark_value)
+
+    # Forme "ark:/12148/bpt6k…"
+    if ark_value.startswith("ark:/12148/"):
+        short = ark_value.replace("ark:/12148/", "")
+        return f"{GALLICA_BASE}/ark:/12148/{short}"
+
+    # Forme courte "bpt6k…" ou "btv1b…" (retournée par l'API Issues)
+    if re.match(r"^[a-z0-9]+$", ark_value):
+        return f"{GALLICA_BASE}/ark:/12148/{ark_value}"
+
+    # Fallback : on retourne tel quel
+    return ark_value
+
+
 def get_issues_via_sru(ark_id: str, max_records: int = MAX_ISSUES) -> list[dict]:
     """
     Méthode principale : arkPress all "cb32731059c_date"
-    Recommandée par la documentation BnF.
     """
     short_id = ark_id.replace("ark:/12148/", "")
     ark_press = f"{short_id}_date"
@@ -77,18 +104,14 @@ def get_issues_via_sru(ark_id: str, max_records: int = MAX_ISSUES) -> list[dict]
                 m = re.search(rf"<dc:{tag}[^>]*>(.*?)</dc:{tag}>", text, re.DOTALL)
                 return m.group(1).strip() if m else ""
 
-            identifier = first("identifier")
-            if not identifier.startswith("http"):
-                identifier = f"{GALLICA_BASE}/{identifier}" if identifier else ""
-
-            m_ark = re.search(r"ark:/12148/\S+", identifier)
-            clean_url = f"{GALLICA_BASE}/{m_ark.group(0)}" if m_ark else identifier
+            raw_id = first("identifier")
+            url = build_gallica_url(raw_id)
 
             issues.append({
-                "titre":       first("title") or "(sans titre)",
                 "date":        first("date"),
+                "titre":       first("title") or "(sans titre)",
                 "description": first("description"),
-                "url":         clean_url,
+                "url":         url,
             })
 
         start_record += page_size
@@ -135,13 +158,18 @@ def get_issues_via_issues_api(ark_id: str) -> list[dict]:
         except requests.exceptions.RequestException:
             continue
 
-        for m in re.finditer(r'<issue[^>]*ark="([^"]+)"[^>]*>(.*?)</issue>', r2.text, re.DOTALL):
-            issue_ark = m.group(1)
-            precision = re.sub(r"<[^>]+>", "", m.group(2)).strip()
-            clean_url = f"{GALLICA_BASE}/{issue_ark}" if not issue_ark.startswith("http") else issue_ark
+        # L'API retourne : <issue ark="bpt6k310197" dayOfYear="…">1841/01/01 (T1,N1).</issue>
+        for m in re.finditer(
+            r'<issue\b[^>]*\bark="([^"]+)"[^>]*>([^<]*)</issue>',
+            r2.text
+        ):
+            raw_ark  = m.group(1).strip()   # ex: "bpt6k310197"
+            label    = m.group(2).strip()   # ex: "1841/01/01 (T1,N1)."
+            clean_url = build_gallica_url(raw_ark)
+
             issues.append({
-                "titre":       precision or f"Numéro de {year}",
                 "date":        year,
+                "titre":       label or f"Numéro de {year}",
                 "description": "",
                 "url":         clean_url,
             })
@@ -212,17 +240,15 @@ if url:
         st.metric("Numéros récupérés", len(issues))
         st.caption(f"Source : {method_used}")
 
-        df = pd.DataFrame(issues)
+        df = pd.DataFrame(issues)[["date", "titre", "description", "url"]]
 
-        if "url" in df.columns:
-            df_display = df.copy()
-            df_display["url"] = df_display["url"].apply(
-                lambda u: f'<a href="{u}" target="_blank">🔗 Voir</a>' if u else ""
-            )
-            st.write(df_display.to_html(escape=False, index=False), unsafe_allow_html=True)
-        else:
-            st.dataframe(df, use_container_width=True)
+        df_display = df.copy()
+        df_display["url"] = df_display["url"].apply(
+            lambda u: f'<a href="{u}" target="_blank">🔗 Voir</a>' if u else ""
+        )
+        st.write(df_display.to_html(escape=False, index=False), unsafe_allow_html=True)
 
+        # Export CSV avec URLs en clair
         csv = df.to_csv(index=False).encode("utf-8")
         st.download_button(
             label="⬇️ Télécharger en CSV",
