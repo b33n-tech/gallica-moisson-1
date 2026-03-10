@@ -3,15 +3,13 @@ import requests
 import re
 import time
 import pandas as pd
-from urllib.parse import urlparse
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 
 GALLICA_SRU    = "https://gallica.bnf.fr/SRU"
-GALLICA_IIIF   = "https://gallica.bnf.fr/iiif"
 GALLICA_BASE   = "https://gallica.bnf.fr"
-TIMEOUT        = 15   # secondes par requête
-MAX_ISSUES     = 500  # garde-fou pour éviter les boucles infinies
+TIMEOUT        = 15
+MAX_ISSUES     = 500
 
 HEADERS = {
     "User-Agent": (
@@ -23,66 +21,53 @@ HEADERS = {
 # ─── Utilitaires ──────────────────────────────────────────────────────────────
 
 def extract_ark(url: str) -> str | None:
-    """
-    Extrait l'identifiant ARK depuis une URL Gallica.
-    Accepte des formes comme :
-      https://gallica.bnf.fr/ark:/12148/cb32798952d/date
-      https://gallica.bnf.fr/ark:/12148/cb32798952d
-    Retourne None si aucun ARK n'est trouvé.
-    """
     match = re.search(r"ark:/12148/([a-z0-9]+)", url)
     if match:
         return f"ark:/12148/{match.group(1)}"
     return None
 
 
-def get_issues(ark: str, max_records: int = MAX_ISSUES) -> list[dict]:
+def get_issues_via_sru(ark_id: str, max_records: int = MAX_ISSUES) -> list[dict]:
     """
-    Récupère la liste des numéros d'une revue via l'API SRU de Gallica.
-    Retourne une liste de dicts avec au moins : ark, titre, date, url.
-    Lève une exception explicite en cas d'erreur réseau ou de réponse inattendue.
+    Méthode principale : arkPress all "cb32731059c_date"
+    Recommandée par la documentation BnF.
     """
-    # L'ARK d'une revue se termine souvent par /date — on le retire pour la requête
-    base_ark = ark.split("/date")[0]
+    short_id = ark_id.replace("ark:/12148/", "")
+    ark_press = f"{short_id}_date"
 
     issues = []
     start_record = 1
-    page_size = 50   # Gallica accepte jusqu'à 50 par page
+    page_size = 50
+    total = None
 
     while True:
         params = {
-            "operation": "searchRetrieve",
-            "version": "1.2",
-            "query": f'dc.relation="{base_ark}" and dc.type="fascicule"',
-            "startRecord": start_record,
+            "operation":      "searchRetrieve",
+            "version":        "1.2",
+            "query":          f'(dc.type all "fascicule") and arkPress all "{ark_press}"',
+            "startRecord":    start_record,
             "maximumRecords": page_size,
-            "collapsing": "false",
+            "collapsing":     "false",
         }
 
         try:
             resp = requests.get(GALLICA_SRU, params=params, headers=HEADERS, timeout=TIMEOUT)
             resp.raise_for_status()
         except requests.exceptions.Timeout:
-            raise TimeoutError(
-                f"Gallica SRU n'a pas répondu dans les {TIMEOUT}s "
-                f"(page {start_record}–{start_record + page_size - 1})."
-            )
+            raise TimeoutError(f"Gallica SRU n'a pas répondu dans les {TIMEOUT}s.")
         except requests.exceptions.HTTPError as e:
             raise ConnectionError(f"Erreur HTTP {resp.status_code} : {e}")
         except requests.exceptions.RequestException as e:
             raise ConnectionError(f"Erreur réseau : {e}")
 
-        # --- Parsing XML léger sans lxml ---
         xml = resp.text
 
-        # Nombre total de résultats (première page seulement)
         if start_record == 1:
             m = re.search(r"<numberOfRecords>(\d+)</numberOfRecords>", xml)
             total = int(m.group(1)) if m else 0
             if total == 0:
-                break  # aucun numéro trouvé
+                break
 
-        # Extraction des enregistrements
         records = re.findall(r"<srw:record>(.*?)</srw:record>", xml, re.DOTALL)
         if not records:
             break
@@ -92,14 +77,12 @@ def get_issues(ark: str, max_records: int = MAX_ISSUES) -> list[dict]:
                 m = re.search(rf"<dc:{tag}[^>]*>(.*?)</dc:{tag}>", text, re.DOTALL)
                 return m.group(1).strip() if m else ""
 
-            ark_issue = first("identifier")
-            # Gallica renvoie parfois des URL complètes, parfois juste l'ARK
-            if not ark_issue.startswith("http"):
-                ark_issue = f"{GALLICA_BASE}/{ark_issue}" if ark_issue else ""
-            
-            # Récupère l'ARK court pour construire l'URL propre
-            m_ark = re.search(r"ark:/12148/\S+", ark_issue)
-            clean_url = f"{GALLICA_BASE}/{m_ark.group(0)}" if m_ark else ark_issue
+            identifier = first("identifier")
+            if not identifier.startswith("http"):
+                identifier = f"{GALLICA_BASE}/{identifier}" if identifier else ""
+
+            m_ark = re.search(r"ark:/12148/\S+", identifier)
+            clean_url = f"{GALLICA_BASE}/{m_ark.group(0)}" if m_ark else identifier
 
             issues.append({
                 "titre":       first("title") or "(sans titre)",
@@ -112,7 +95,58 @@ def get_issues(ark: str, max_records: int = MAX_ISSUES) -> list[dict]:
         if start_record > min(total, max_records):
             break
 
-        time.sleep(0.3)  # politesse envers l'API
+        time.sleep(0.3)
+
+    return issues
+
+
+def get_issues_via_issues_api(ark_id: str) -> list[dict]:
+    """
+    Fallback : API Issues de Gallica, récupère fascicule par fascicule.
+    """
+    base_url = f"{GALLICA_BASE}/services/Issues"
+
+    try:
+        r = requests.get(
+            base_url,
+            params={"ark": f"{ark_id}/date"},
+            headers=HEADERS,
+            timeout=TIMEOUT,
+        )
+        r.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        raise ConnectionError(f"Erreur API Issues (années) : {e}")
+
+    years = re.findall(r"<year>(\d{4})</year>", r.text)
+    if not years:
+        return []
+
+    issues = []
+
+    for year in years:
+        try:
+            r2 = requests.get(
+                base_url,
+                params={"ark": f"{ark_id}/date", "date": year},
+                headers=HEADERS,
+                timeout=TIMEOUT,
+            )
+            r2.raise_for_status()
+        except requests.exceptions.RequestException:
+            continue
+
+        for m in re.finditer(r'<issue[^>]*ark="([^"]+)"[^>]*>(.*?)</issue>', r2.text, re.DOTALL):
+            issue_ark = m.group(1)
+            precision = re.sub(r"<[^>]+>", "", m.group(2)).strip()
+            clean_url = f"{GALLICA_BASE}/{issue_ark}" if not issue_ark.startswith("http") else issue_ark
+            issues.append({
+                "titre":       precision or f"Numéro de {year}",
+                "date":        year,
+                "description": "",
+                "url":         clean_url,
+            })
+
+        time.sleep(0.2)
 
     return issues
 
@@ -128,11 +162,10 @@ st.caption(
 
 url = st.text_input(
     "URL de la revue Gallica",
-    placeholder="ex. : https://gallica.bnf.fr/ark:/12148/cb32798952d/date",
+    placeholder="ex. : https://gallica.bnf.fr/ark:/12148/cb32731059c/date",
 )
 
 if url:
-    # ── Étape 1 : extraction de l'ARK ──────────────────────────────────────
     ark = extract_ark(url)
 
     if not ark:
@@ -145,47 +178,52 @@ if url:
 
     st.success(f"✅ ARK détecté : `{ark}`")
 
-    # ── Étape 2 : moissonnage ───────────────────────────────────────────────
-    with st.spinner("Interrogation de l'API Gallica SRU…"):
-        try:
-            issues = get_issues(ark)
-        except TimeoutError as e:
-            st.error(f"⏱️ Délai dépassé : {e}")
-            st.stop()
-        except ConnectionError as e:
-            st.error(f"🌐 Erreur réseau : {e}")
-            st.stop()
-        except Exception as e:
-            st.error(f"💥 Erreur inattendue : {e}")
-            st.stop()
+    issues = []
+    method_used = ""
 
-    # ── Étape 3 : affichage des résultats ───────────────────────────────────
+    with st.spinner("Interrogation de l'API Gallica SRU (méthode arkPress)…"):
+        try:
+            issues = get_issues_via_sru(ark)
+            method_used = "SRU / arkPress"
+        except (TimeoutError, ConnectionError) as e:
+            st.warning(f"⚠️ SRU indisponible ({e}), bascule sur l'API Issues…")
+        except Exception as e:
+            st.warning(f"⚠️ Erreur SRU inattendue ({e}), bascule sur l'API Issues…")
+
+    if not issues:
+        with st.spinner("Interrogation de l'API Issues de Gallica…"):
+            try:
+                issues = get_issues_via_issues_api(ark)
+                method_used = "API Issues (fallback)"
+            except (TimeoutError, ConnectionError) as e:
+                st.error(f"🌐 Erreur réseau : {e}")
+                st.stop()
+            except Exception as e:
+                st.error(f"💥 Erreur inattendue : {e}")
+                st.stop()
+
     if not issues:
         st.warning(
             "⚠️ Aucun numéro trouvé. "
-            "L'ARK détecté ne correspond peut-être pas à une revue, "
-            "ou la revue n'est pas indexée via le type « fascicule »."
+            "L'ARK ne correspond peut-être pas à une revue, "
+            "ou celle-ci n'est pas indexée comme « fascicule »."
         )
     else:
         st.metric("Numéros récupérés", len(issues))
+        st.caption(f"Source : {method_used}")
 
         df = pd.DataFrame(issues)
 
-        # Colonne URL cliquable
         if "url" in df.columns:
-            df["url"] = df["url"].apply(
+            df_display = df.copy()
+            df_display["url"] = df_display["url"].apply(
                 lambda u: f'<a href="{u}" target="_blank">🔗 Voir</a>' if u else ""
             )
-            st.write(
-                df.to_html(escape=False, index=False),
-                unsafe_allow_html=True,
-            )
+            st.write(df_display.to_html(escape=False, index=False), unsafe_allow_html=True)
         else:
             st.dataframe(df, use_container_width=True)
 
-        # ── Export CSV ──────────────────────────────────────────────────────
-        csv_df = pd.DataFrame(issues)  # version brute (URL en texte)
-        csv = csv_df.to_csv(index=False).encode("utf-8")
+        csv = df.to_csv(index=False).encode("utf-8")
         st.download_button(
             label="⬇️ Télécharger en CSV",
             data=csv,
